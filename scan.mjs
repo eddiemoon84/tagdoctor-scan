@@ -228,9 +228,7 @@ function matchesEvent(req, tracker) {
 
 // ─── 메인 스캔 함수 ──────────────────────────────────────────────────────────
 
-async function scan(targetUrl) {
-  console.log(`\n🔍 TagDoctor 스캔 시작: ${targetUrl}\n`);
-
+export async function scanUrl(targetUrl) {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     userAgent:
@@ -254,7 +252,6 @@ async function scan(targetUrl) {
     });
   } catch (err) {
     if (err.message.includes('Timeout')) {
-      console.log('⏳ networkidle 타임아웃 — domcontentloaded로 폴백합니다...');
       // 폴백 재로드 전 네트워크 요청 초기화 — 중복 누적 방지
       networkRequests.length = 0;
       try {
@@ -263,14 +260,12 @@ async function scan(targetUrl) {
           timeout: 30000,
         });
       } catch (err2) {
-        console.error(`❌ 사이트 접속 실패: ${err2.message}`);
         await browser.close();
-        process.exit(1);
+        throw new Error(`사이트 접속 실패: ${err2.message}`);
       }
     } else {
-      console.error(`❌ 사이트 접속 실패: ${err.message}`);
       await browser.close();
-      process.exit(1);
+      throw new Error(`사이트 접속 실패: ${err.message}`);
     }
   }
 
@@ -402,80 +397,9 @@ async function scan(targetUrl) {
     score = Math.round(totalScore / detectedCount);
   }
 
-  // ─── 콘솔 출력 ─────────────────────────────────────────────────────────────
+  // ─── 리포트 생성 ─────────────────────────────────────────────────────────────
 
   const now = new Date().toISOString();
-
-  console.log('════════════════════════════════');
-  console.log('📋 TagDoctor 진단 리포트');
-  console.log(`🌐 ${targetUrl}`);
-  console.log(`📅 ${now}`);
-  console.log('════════════════════════════════');
-  console.log();
-  console.log(`🟢 전체 점수: ${score}/100`);
-  console.log(`   감지된 태그: ${detectedCount}/${totalTags}`);
-  console.log(`   오류: ${errorCount}건 | 경고: ${warningCount}건`);
-  console.log();
-  console.log('────────────────────────────────');
-
-  for (const [key, r] of Object.entries(results)) {
-    console.log();
-
-    if (!r.detected) {
-      // 미설치
-      console.log(`⬜ ${r.name}`);
-      if (r.kakaoSdkOnly) {
-        console.log(`   상태: 카카오 JS SDK만 감지됨 (픽셀 미설치)`);
-        console.log();
-        printPrescription(PRESCRIPTIONS[key].not_installed_sdk_only);
-      } else {
-        console.log(`   상태: 미설치`);
-        console.log();
-        printPrescription(PRESCRIPTIONS[key].not_installed);
-      }
-    } else if (r.isMultiContainer) {
-      // 복수 컨테이너 (GTM 전용 — 서로 다른 ID)
-      console.log(`ℹ️  ${r.name}`);
-      console.log(`   ID: ${r.ids.join(', ')}`);
-      console.log(`   서로 다른 컨테이너 ${r.ids.length}개 감지 (스크립트 ${r.scriptLoadCount}회)`);
-      if (r.hasEventFire) {
-        console.log(`   📡 이벤트 전송: ${r.eventFireCount}건 감지됨`);
-      }
-      console.log();
-      printPrescription(PRESCRIPTIONS[key].multi_container);
-    } else if (r.isDuplicate) {
-      // 중복
-      console.log(`⚠️  ${r.name}`);
-      if (r.ids.length > 0) {
-        console.log(`   ID: ${r.ids.join(', ')}`);
-      }
-      console.log(`   메인 스크립트 ${r.scriptLoadCount}회 로드됨 (중복!)`);
-      if (r.hasEventFire) {
-        console.log(`   📡 이벤트 전송: ${r.eventFireCount}건 감지됨`);
-      }
-      console.log();
-      printPrescription(PRESCRIPTIONS[key].duplicate);
-    } else {
-      // 정상
-      console.log(`✅ ${r.name}`);
-      if (r.id) console.log(`   ID: ${r.id}`);
-      if (r.scriptLoadCount > 0) console.log(`   스크립트 로드: ${r.scriptLoadCount}회`);
-      if (r.hasGlobal) console.log(`   글로벌 변수: 감지됨`);
-
-      if (r.hasEventFire) {
-        console.log(`   📡 이벤트 전송: ${r.eventFireCount}건 감지됨 ✅`);
-      } else if (PRESCRIPTIONS[key].no_event) {
-        console.log(`   📡 이벤트 전송: 감지되지 않음 ⚠️`);
-        console.log();
-        printPrescription(PRESCRIPTIONS[key].no_event);
-      }
-    }
-  }
-
-  console.log();
-  console.log('════════════════════════════════');
-
-  // ─── JSON 저장 ──────────────────────────────────────────────────────────────
 
   const report = {
     url: targetUrl,
@@ -490,32 +414,50 @@ async function scan(targetUrl) {
     tags: results,
   };
 
-  const filename = `report_${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-  writeFileSync(filename, JSON.stringify(report, null, 2));
-  console.log(`\n📁 리포트 저장됨: ${filename}`);
+  return report;
 }
 
-function printPrescription(text) {
-  if (!text) return;
-  const lines = text.split('\n');
-  console.log(`   💡 ${lines[0]}`);
-  for (const line of lines.slice(1)) {
-    console.log(`   ${line}`);
+// ─── CLI 진입점 (직접 실행 시에만 동작) ──────────────────────────────────────
+
+const isCLI = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/'));
+
+if (isCLI) {
+  const url = process.argv[2];
+  if (!url) {
+    console.error('사용법: node scan.mjs <URL>');
+    console.error('예시:   node scan.mjs https://www.cafe24.com');
+    process.exit(1);
+  }
+
+  let targetUrl = url;
+  if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+    targetUrl = 'https://' + targetUrl;
+  }
+
+  console.log(`\n🔍 TagDoctor 스캔 시작: ${targetUrl}\n`);
+  try {
+    const report = await scanUrl(targetUrl);
+
+    // 콘솔 출력
+    console.log('════════════════════════════════');
+    console.log(`📋 TagDoctor 진단 리포트`);
+    console.log(`🌐 ${report.url}`);
+    console.log(`📅 ${report.scannedAt}`);
+    console.log(`🟢 전체 점수: ${report.score}/100`);
+    console.log(`   감지: ${report.summary.detectedCount}/${report.summary.totalTags} | 경고: ${report.summary.warnings}건`);
+    console.log('════════════════════════════════');
+
+    for (const [, r] of Object.entries(report.tags)) {
+      const icon = !r.detected ? '⬜' : r.isDuplicate ? '⚠️ ' : r.isMultiContainer ? 'ℹ️ ' : '✅';
+      console.log(`${icon} ${r.name} [${r.status}]${r.ids.length ? ' ID: ' + r.ids.join(', ') : ''}`);
+    }
+
+    // JSON 저장
+    const filename = `report_${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    writeFileSync(filename, JSON.stringify(report, null, 2));
+    console.log(`\n📁 리포트 저장됨: ${filename}`);
+  } catch (err) {
+    console.error(`❌ ${err.message}`);
+    process.exit(1);
   }
 }
-
-// ─── CLI 진입점 ──────────────────────────────────────────────────────────────
-
-const url = process.argv[2];
-if (!url) {
-  console.error('사용법: node scan.mjs <URL>');
-  console.error('예시:   node scan.mjs https://www.cafe24.com');
-  process.exit(1);
-}
-
-let targetUrl = url;
-if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-  targetUrl = 'https://' + targetUrl;
-}
-
-scan(targetUrl);

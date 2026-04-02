@@ -2,15 +2,17 @@
   "name": "tag_doctor",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "server.mjs",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.mjs",
+    "scan": "node scan.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "express": "^5.2.1",
     "playwright": "^1.58.2"
   }
 }

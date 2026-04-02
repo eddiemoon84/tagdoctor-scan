@@ -1,0 +1,6 @@
+node_modules
+report_*.json
+.env
+.git
+.gitignore
+.claude
