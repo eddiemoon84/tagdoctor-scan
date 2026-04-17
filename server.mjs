@@ -1,5 +1,5 @@
 import express from 'express';
-import { scanUrl } from './scan.mjs';
+import { scanUrl, scanMultiplePages } from './scan.mjs';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -60,6 +60,62 @@ app.post('/api/scan', async (req, res) => {
     clearTimeout(timeout);
     if (!res.headersSent) {
       console.error(`[scan] error: ${targetUrl}`, err.message);
+      res.status(500).json({ error: err.message });
+    }
+  }
+});
+
+// ─── 멀티페이지 스캔 API ─────────────────────────────────────────────────────
+
+const VALID_PAGE_TYPES = new Set(['home', 'product', 'cart', 'checkout', 'thankyou', 'custom']);
+
+app.post('/api/scan-multi', async (req, res) => {
+  const { pages } = req.body || {};
+
+  if (!Array.isArray(pages) || pages.length === 0) {
+    return res.status(400).json({ error: 'pages array is required' });
+  }
+  if (pages.length > 5) {
+    return res.status(400).json({ error: 'Maximum 5 pages allowed' });
+  }
+
+  const normalized = [];
+  for (const p of pages) {
+    if (!p || typeof p.url !== 'string') {
+      return res.status(400).json({ error: 'Each page must have a url' });
+    }
+    let url = p.url.trim();
+    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+    try {
+      new URL(url);
+    } catch {
+      return res.status(400).json({ error: `Invalid URL: ${p.url}` });
+    }
+    const type = VALID_PAGE_TYPES.has(p.type) ? p.type : 'custom';
+    normalized.push({ url, type, label: p.label });
+  }
+
+  // 페이지당 최대 60s → 5 페이지 × 60s + 여유 = 340s
+  const timeoutMs = Math.min(60000 * normalized.length + 30000, 330000);
+  console.log(`[scan-multi] start: ${normalized.length} pages`);
+  const timeout = setTimeout(() => {
+    if (!res.headersSent) {
+      console.log(`[scan-multi] timeout after ${timeoutMs}ms`);
+      res.status(504).json({ error: 'Multi-scan timed out' });
+    }
+  }, timeoutMs);
+
+  try {
+    const report = await scanMultiplePages(normalized);
+    clearTimeout(timeout);
+    if (!res.headersSent) {
+      console.log(`[scan-multi] done: ${normalized.length} pages (score: ${report.overallScore})`);
+      res.json(report);
+    }
+  } catch (err) {
+    clearTimeout(timeout);
+    if (!res.headersSent) {
+      console.error(`[scan-multi] error:`, err.message);
       res.status(500).json({ error: err.message });
     }
   }

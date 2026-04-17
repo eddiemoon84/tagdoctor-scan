@@ -23,6 +23,11 @@ const TRACKERS = {
       const m = url.match(/config\/(\d+)/);
       return m ? m[1] : null;
     },
+    // 이벤트명 추출: /tr/?id=...&ev=PageView
+    extractEventName: (url) => {
+      const m = url.match(/[?&]ev=([^&]+)/);
+      return m ? decodeURIComponent(m[1]) : null;
+    },
   },
   ga4: {
     name: 'GA4',
@@ -38,6 +43,11 @@ const TRACKERS = {
     extractId: (url) => {
       const m = url.match(/[?&]id=(G-[A-Z0-9]+)/);
       return m ? m[1] : null;
+    },
+    // 이벤트명 추출: /g/collect?tid=G-...&en=page_view
+    extractEventName: (url) => {
+      const m = url.match(/[?&]en=([^&]+)/);
+      return m ? decodeURIComponent(m[1]) : null;
     },
   },
   gtm: {
@@ -92,6 +102,10 @@ const TRACKERS = {
     extractId: (url) => {
       const m = url.match(/sdkid=([A-Z0-9]+)/i);
       return m ? m[1] : null;
+    },
+    extractEventName: (url) => {
+      const m = url.match(/[?&]event=([^&]+)/);
+      return m ? decodeURIComponent(m[1]) : null;
     },
   },
   criteo: {
@@ -210,6 +224,44 @@ const PRESCRIPTIONS = {
   },
 };
 
+// ─── 페이지 유형별 필수 이벤트 ────────────────────────────────────────────────
+
+const PAGE_TYPE_REQUIRED_EVENTS = {
+  home: {
+    meta_pixel: ['PageView'],
+    ga4: ['page_view'],
+  },
+  product: {
+    meta_pixel: ['PageView', 'ViewContent'],
+    ga4: ['page_view', 'view_item'],
+  },
+  cart: {
+    meta_pixel: ['PageView', 'AddToCart'],
+    ga4: ['page_view', 'add_to_cart'],
+  },
+  checkout: {
+    meta_pixel: ['PageView', 'InitiateCheckout'],
+    ga4: ['page_view', 'begin_checkout'],
+  },
+  thankyou: {
+    meta_pixel: ['PageView', 'Purchase'],
+    ga4: ['page_view', 'purchase'],
+  },
+  custom: {
+    meta_pixel: ['PageView'],
+    ga4: ['page_view'],
+  },
+};
+
+const PAGE_TYPE_LABELS = {
+  home: '🏠 메인 페이지',
+  product: '📦 상품 상세',
+  cart: '🛒 장바구니',
+  checkout: '💳 결제',
+  thankyou: '✅ 결제 완료',
+  custom: '📄 페이지',
+};
+
 // ─── 매칭 헬퍼 ───────────────────────────────────────────────────────────────
 
 function matchesScript(req, tracker) {
@@ -252,15 +304,14 @@ function detectHosting(htmlContent, requests) {
 
 // ─── 메인 스캔 함수 ──────────────────────────────────────────────────────────
 
-export async function scanUrl(targetUrl) {
-  const browser = await chromium.launch({ headless: true });
+// 단일 페이지 로드 + 데이터 수집 (browser 재사용 가능)
+async function collectPageData(browser, targetUrl) {
   const context = await browser.newContext({
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   });
   const page = await context.newPage();
 
-  // 네트워크 요청 수집 — URL + resourceType
   const networkRequests = [];
   page.on('request', (req) => {
     networkRequests.push({
@@ -270,70 +321,54 @@ export async function scanUrl(targetUrl) {
   });
 
   try {
-    await page.goto(targetUrl, {
-      waitUntil: 'networkidle',
-      timeout: 30000,
-    });
-  } catch (err) {
-    if (err.message.includes('Timeout')) {
-      // 폴백 재로드 전 네트워크 요청 초기화 — 중복 누적 방지
-      networkRequests.length = 0;
-      try {
-        await page.goto(targetUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000,
-        });
-      } catch (err2) {
-        await browser.close();
-        throw new Error(`사이트 접속 실패: ${err2.message}`);
+    try {
+      await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
+    } catch (err) {
+      if (err.message.includes('Timeout')) {
+        networkRequests.length = 0;
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } else {
+        throw new Error(`사이트 접속 실패: ${err.message}`);
       }
-    } else {
-      await browser.close();
-      throw new Error(`사이트 접속 실패: ${err.message}`);
     }
+
+    await page.waitForTimeout(3000);
+
+    const allGlobalKeys = [
+      ...new Set(Object.values(TRACKERS).flatMap((t) => t.globals)),
+      'Kakao',
+    ];
+    const globalResults = await page.evaluate((keys) => {
+      const result = {};
+      for (const key of keys) {
+        result[key] = typeof window[key] !== 'undefined';
+      }
+      return result;
+    }, allGlobalKeys);
+
+    const htmlContent = await page.content();
+
+    return { networkRequests, globalResults, htmlContent };
+  } finally {
+    await context.close();
   }
+}
 
-  // 지연 로드 태그 감지를 위해 추가 대기
-  await page.waitForTimeout(3000);
-
-  // 글로벌 변수 체크 (kakaoPixel + Kakao 둘 다 체크)
-  const allGlobalKeys = [
-    ...new Set(Object.values(TRACKERS).flatMap((t) => t.globals)),
-    'Kakao', // 카카오 JS SDK (로그인/공유) 감지용
-  ];
-  const globalResults = await page.evaluate((keys) => {
-    const result = {};
-    for (const key of keys) {
-      result[key] = typeof window[key] !== 'undefined';
-    }
-    return result;
-  }, allGlobalKeys);
-
-  // 호스팅 감지용 HTML 수집
-  const htmlContent = await page.content();
-
-  await browser.close();
-
-  // ─── 분석 ───────────────────────────────────────────────────────────────────
-
+// 수집된 데이터 + 페이지 유형으로 분석 결과 생성
+function analyzePageData({ networkRequests, globalResults, htmlContent }, pageType) {
   const results = {};
 
   for (const [key, tracker] of Object.entries(TRACKERS)) {
-    // 메인 스크립트 매칭 (중복 판정용)
     const scriptReqs = networkRequests.filter((req) => matchesScript(req, tracker));
-
-    // 이벤트 전송 매칭 (fire 감지용)
     const eventReqs = networkRequests.filter((req) => matchesEvent(req, tracker));
-
     const hasGlobal = tracker.globals.some((g) => globalResults[g]);
 
-    // requiredGlobal 체크: 설정된 경우 해당 글로벌이 없으면 미설치 판정
     let detected = scriptReqs.length > 0 || hasGlobal;
     if (tracker.requiredGlobal && !globalResults[tracker.requiredGlobal]) {
       detected = false;
     }
 
-    // ID 추출 — scriptReqs + idExtractionPatterns 매칭 요청에서 추출
+    // ID 추출
     const ids = new Set();
     for (const req of scriptReqs) {
       const id = tracker.extractId(req.url);
@@ -349,12 +384,36 @@ export async function scanUrl(targetUrl) {
     }
     const uniqueIds = [...ids];
 
+    // 이벤트명 추출
+    const detectedEvents = [];
+    if (tracker.extractEventName) {
+      const seen = new Set();
+      for (const req of eventReqs) {
+        const evName = tracker.extractEventName(req.url);
+        if (evName && !seen.has(evName)) {
+          seen.add(evName);
+          detectedEvents.push(evName);
+        }
+      }
+    }
+
+    // 필수 이벤트 검증 (페이지 유형 기준)
+    let requiredEvents = null;
+    const requiredList = PAGE_TYPE_REQUIRED_EVENTS[pageType]?.[key];
+    if (requiredList && detected) {
+      const missing = requiredList.filter((e) => !detectedEvents.includes(e));
+      requiredEvents = {
+        required: requiredList,
+        detected: detectedEvents.filter((e) => requiredList.includes(e)),
+        missing,
+      };
+    }
+
     // 중복 판정
     let isDuplicate = false;
     let isMultiContainer = false;
     const scriptLoadCount = scriptReqs.length;
     if (uniqueIds.length >= 2) {
-      // GTM 특수: 서로 다른 ID → 복수 컨테이너 (의도적 운영 가능)
       if (key === 'gtm') {
         isMultiContainer = true;
       } else {
@@ -364,14 +423,23 @@ export async function scanUrl(targetUrl) {
       isDuplicate = true;
     }
 
-    // 이벤트 fire 여부
     const hasEventFire = eventReqs.length > 0;
 
-    // 카카오 특수 처리: kakaoPixel 없이 Kakao만 있는 경우
     let kakaoSdkOnly = false;
     if (key === 'kakao' && !detected && globalResults['Kakao']) {
       kakaoSdkOnly = true;
     }
+
+    // 상태 결정 (required events 반영)
+    let status;
+    if (!detected) status = 'not_installed';
+    else if (isDuplicate) status = 'duplicate';
+    else if (isMultiContainer) status = 'multi_container';
+    else if (requiredEvents && requiredEvents.missing.length === requiredEvents.required.length) {
+      status = 'missing_events';
+    }
+    else if (requiredEvents && requiredEvents.missing.length > 0) status = 'partial_events';
+    else status = 'ok';
 
     results[key] = {
       name: tracker.name,
@@ -385,24 +453,18 @@ export async function scanUrl(targetUrl) {
       ids: uniqueIds,
       id: uniqueIds[0] || null,
       kakaoSdkOnly,
-      status: !detected
-        ? 'not_installed'
-        : isDuplicate
-          ? 'duplicate'
-          : isMultiContainer
-            ? 'multi_container'
-            : 'ok',
+      detectedEvents,
+      requiredEvents,
+      status,
     };
   }
 
-  // ─── 점수 계산 ─────────────────────────────────────────────────────────────
-
+  // 점수 계산
   const detectedTags = Object.values(results).filter((r) => r.detected);
   const detectedCount = detectedTags.length;
   const totalTags = Object.keys(results).length;
 
   let score = 0;
-  let errorCount = 0;
   let warningCount = 0;
 
   if (detectedCount > 0) {
@@ -412,8 +474,13 @@ export async function scanUrl(targetUrl) {
         totalScore += 60;
         warningCount++;
       } else if (tag.isMultiContainer) {
-        // 복수 컨테이너는 의도적 운영 가능 — 경고가 아닌 참고
         totalScore += 90;
+      } else if (tag.status === 'missing_events') {
+        totalScore += 50;
+        warningCount++;
+      } else if (tag.status === 'partial_events') {
+        totalScore += 70;
+        warningCount++;
       } else if (!tag.hasEventFire && PRESCRIPTIONS[Object.keys(results).find((k) => results[k] === tag)]?.no_event) {
         totalScore += 80;
         warningCount++;
@@ -424,26 +491,92 @@ export async function scanUrl(targetUrl) {
     score = Math.round(totalScore / detectedCount);
   }
 
-  // ─── 리포트 생성 ─────────────────────────────────────────────────────────────
-
-  const now = new Date().toISOString();
-
-  const report = {
-    url: targetUrl,
-    scannedAt: now,
-    hosting: detectHosting(htmlContent, networkRequests),
+  return {
     score,
-    summary: {
-      detectedCount,
-      totalTags,
-      errors: errorCount,
-      warnings: warningCount,
-    },
+    summary: { detectedCount, totalTags, errors: 0, warnings: warningCount },
     tags: results,
+    hosting: detectHosting(htmlContent, networkRequests),
   };
-
-  return report;
 }
+
+// 단일 페이지 스캔 (pageType: home/product/cart/checkout/thankyou/custom)
+export async function scanPage(targetUrl, pageType = 'custom') {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const raw = await collectPageData(browser, targetUrl);
+    const analysis = analyzePageData(raw, pageType);
+    return {
+      url: targetUrl,
+      type: pageType,
+      scannedAt: new Date().toISOString(),
+      ...analysis,
+    };
+  } finally {
+    await browser.close();
+  }
+}
+
+// 여러 페이지 순차 스캔 (브라우저 공유)
+export async function scanMultiplePages(pages) {
+  if (!Array.isArray(pages) || pages.length === 0) {
+    throw new Error('pages 배열이 비어 있습니다');
+  }
+
+  const browser = await chromium.launch({ headless: true });
+  const pageReports = [];
+
+  try {
+    for (const p of pages) {
+      const url = p.url;
+      const pageType = p.type || 'custom';
+      try {
+        const raw = await collectPageData(browser, url);
+        const analysis = analyzePageData(raw, pageType);
+        pageReports.push({
+          url,
+          type: pageType,
+          label: p.label || PAGE_TYPE_LABELS[pageType] || url,
+          scannedAt: new Date().toISOString(),
+          ...analysis,
+        });
+      } catch (err) {
+        pageReports.push({
+          url,
+          type: pageType,
+          label: p.label || PAGE_TYPE_LABELS[pageType] || url,
+          scannedAt: new Date().toISOString(),
+          error: err.message,
+          score: 0,
+          summary: { detectedCount: 0, totalTags: Object.keys(TRACKERS).length, errors: 1, warnings: 0 },
+          tags: {},
+          hosting: null,
+        });
+      }
+    }
+  } finally {
+    await browser.close();
+  }
+
+  const validReports = pageReports.filter((p) => !p.error);
+  const overallScore = validReports.length > 0
+    ? Math.round(validReports.reduce((s, p) => s + p.score, 0) / validReports.length)
+    : 0;
+
+  // 호스팅: 첫 번째 유효 페이지에서
+  const hosting = validReports[0]?.hosting || { id: 'general', name: '일반' };
+
+  return {
+    url: pages[0].url,
+    scannedAt: new Date().toISOString(),
+    hosting,
+    overallScore,
+    pageCount: pageReports.length,
+    pages: pageReports,
+  };
+}
+
+// 하위 호환: scanUrl → scanPage
+export const scanUrl = scanPage;
 
 // ─── CLI 진입점 (직접 실행 시에만 동작) ──────────────────────────────────────
 
