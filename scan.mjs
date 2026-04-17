@@ -226,6 +226,30 @@ function matchesEvent(req, tracker) {
   return false;
 }
 
+// ─── 호스팅 플랫폼 감지 ──────────────────────────────────────────────────────
+
+function detectHosting(htmlContent, requests) {
+  const html = htmlContent.toLowerCase();
+  const urls = requests.map((r) => r.url.toLowerCase()).join(' ');
+
+  if (html.includes('cafe24') || urls.includes('cafe24.com') || urls.includes('echosting.cafe24')) {
+    return { id: 'cafe24', name: '카페24' };
+  }
+  if (urls.includes('imweb.me') || html.includes('imweb')) {
+    return { id: 'imweb', name: '아임웹' };
+  }
+  if (urls.includes('godo.co.kr') || html.includes('/data/goods/') || html.includes('<!-- godo -->')) {
+    return { id: 'godo', name: '고도몰' };
+  }
+  if (urls.includes('makeshop.co.kr') || html.includes('makeshop')) {
+    return { id: 'makeshop', name: '메이크샵' };
+  }
+  if (urls.includes('/wp-content/') || urls.includes('/wp-includes/') || /<meta[^>]+generator[^>]+wordpress/i.test(htmlContent)) {
+    return { id: 'wordpress', name: 'WordPress' };
+  }
+  return { id: 'general', name: '일반' };
+}
+
 // ─── 메인 스캔 함수 ──────────────────────────────────────────────────────────
 
 export async function scanUrl(targetUrl) {
@@ -284,6 +308,9 @@ export async function scanUrl(targetUrl) {
     }
     return result;
   }, allGlobalKeys);
+
+  // 호스팅 감지용 HTML 수집
+  const htmlContent = await page.content();
 
   await browser.close();
 
@@ -404,6 +431,7 @@ export async function scanUrl(targetUrl) {
   const report = {
     url: targetUrl,
     scannedAt: now,
+    hosting: detectHosting(htmlContent, networkRequests),
     score,
     summary: {
       detectedCount,
@@ -442,6 +470,7 @@ if (isCLI) {
     console.log('════════════════════════════════');
     console.log(`📋 TagDoctor 진단 리포트`);
     console.log(`🌐 ${report.url}`);
+    console.log(`🏠 호스팅: ${report.hosting.name}`);
     console.log(`📅 ${report.scannedAt}`);
     console.log(`🟢 전체 점수: ${report.score}/100`);
     console.log(`   감지: ${report.summary.detectedCount}/${report.summary.totalTags} | 경고: ${report.summary.warnings}건`);
