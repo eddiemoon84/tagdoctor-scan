@@ -23,11 +23,8 @@ const TRACKERS = {
       const m = url.match(/config\/(\d+)/);
       return m ? m[1] : null;
     },
-    // 이벤트명 추출: /tr/?id=...&ev=PageView
-    extractEventName: (url) => {
-      const m = url.match(/[?&]ev=([^&]+)/);
-      return m ? decodeURIComponent(m[1]) : null;
-    },
+    // 이벤트명 추출: /tr/?id=...&ev=PageView (URL + POST body 모두 스캔)
+    extractEventNames: (req) => extractAllMatches(req, /(?:^|[?&\n])ev=([^&\s\n"']+)/g),
   },
   ga4: {
     name: 'GA4',
@@ -45,10 +42,9 @@ const TRACKERS = {
       return m ? m[1] : null;
     },
     // 이벤트명 추출: /g/collect?tid=G-...&en=page_view
-    extractEventName: (url) => {
-      const m = url.match(/[?&]en=([^&]+)/);
-      return m ? decodeURIComponent(m[1]) : null;
-    },
+    // GA4는 다중 이벤트를 POST body(줄바꿈 구분)에 담아 보내므로 body도 스캔
+    // body 시작점도 매치하기 위해 (?:^|[?&\n]) 사용
+    extractEventNames: (req) => extractAllMatches(req, /(?:^|[?&\n])en=([^&\s\n"']+)/g),
   },
   gtm: {
     name: 'GTM',
@@ -103,10 +99,7 @@ const TRACKERS = {
       const m = url.match(/sdkid=([A-Z0-9]+)/i);
       return m ? m[1] : null;
     },
-    extractEventName: (url) => {
-      const m = url.match(/[?&]event=([^&]+)/);
-      return m ? decodeURIComponent(m[1]) : null;
-    },
+    extractEventNames: (req) => extractAllMatches(req, /(?:^|[?&\n"'])event["']?\s*[:=]\s*["']?([^&\s\n"',}]+)/g),
   },
   criteo: {
     name: 'Criteo OneTag',
@@ -262,6 +255,25 @@ const PAGE_TYPE_LABELS = {
   custom: '📄 페이지',
 };
 
+// ─── 이벤트명 추출 헬퍼 ──────────────────────────────────────────────────────
+// URL + POST body를 하나의 문자열로 보고 global regex로 모든 매치 추출
+
+function extractAllMatches(req, regex) {
+  const text = (req.url || '') + '\n' + (req.postData || '');
+  const names = new Set();
+  let m;
+  const re = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : regex.flags + 'g');
+  while ((m = re.exec(text)) !== null) {
+    try {
+      names.add(decodeURIComponent(m[1]));
+    } catch {
+      names.add(m[1]);
+    }
+    if (m.index === re.lastIndex) re.lastIndex++; // 무한루프 방지
+  }
+  return [...names];
+}
+
 // ─── 매칭 헬퍼 ───────────────────────────────────────────────────────────────
 
 function matchesScript(req, tracker) {
@@ -317,6 +329,8 @@ async function collectPageData(browser, targetUrl) {
     networkRequests.push({
       url: req.url(),
       resourceType: req.resourceType(),
+      method: req.method(),
+      postData: req.postData() || '',
     });
   });
 
@@ -384,15 +398,16 @@ function analyzePageData({ networkRequests, globalResults, htmlContent }, pageTy
     }
     const uniqueIds = [...ids];
 
-    // 이벤트명 추출
+    // 이벤트명 추출 (URL + POST body 스캔, 요청당 다중 이벤트 가능)
     const detectedEvents = [];
-    if (tracker.extractEventName) {
+    if (tracker.extractEventNames) {
       const seen = new Set();
       for (const req of eventReqs) {
-        const evName = tracker.extractEventName(req.url);
-        if (evName && !seen.has(evName)) {
-          seen.add(evName);
-          detectedEvents.push(evName);
+        for (const evName of tracker.extractEventNames(req)) {
+          if (!seen.has(evName)) {
+            seen.add(evName);
+            detectedEvents.push(evName);
+          }
         }
       }
     }
