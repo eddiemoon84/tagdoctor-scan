@@ -1,5 +1,6 @@
 import express from 'express';
 import { scanUrl, scanMultiplePages } from './scan.mjs';
+import { markScanning, markFailed, writeSingleScanResult, writeMultiScanResult } from './db.mjs';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -119,6 +120,83 @@ app.post('/api/scan-multi', async (req, res) => {
       res.status(500).json({ error: err.message });
     }
   }
+});
+
+// ─── 비동기 스캔 API (Supabase 직접 업데이트) ─────────────────────────────────
+// 호출자(Vercel)는 즉시 202를 받고 종료. Render가 백그라운드로 스캔 + DB 쓰기.
+
+app.post('/api/scan-async', async (req, res) => {
+  const { scanId, url, pages } = req.body || {};
+
+  if (!scanId || typeof scanId !== 'string') {
+    return res.status(400).json({ error: 'scanId is required' });
+  }
+
+  const isMulti = Array.isArray(pages) && pages.length > 0;
+
+  // 단일 스캔 입력 검증
+  let targetUrl = null;
+  if (!isMulti) {
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ error: 'url or pages is required' });
+    }
+    targetUrl = url.trim();
+    if (!/^https?:\/\//i.test(targetUrl)) targetUrl = 'https://' + targetUrl;
+    try {
+      new URL(targetUrl);
+    } catch {
+      return res.status(400).json({ error: 'Invalid URL format' });
+    }
+  }
+
+  // 멀티 스캔 입력 검증
+  let normalizedPages = null;
+  if (isMulti) {
+    if (pages.length > 5) return res.status(400).json({ error: 'Maximum 5 pages allowed' });
+    normalizedPages = [];
+    for (const p of pages) {
+      if (!p || typeof p.url !== 'string') {
+        return res.status(400).json({ error: 'Each page must have a url' });
+      }
+      let u = p.url.trim();
+      if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+      try {
+        new URL(u);
+      } catch {
+        return res.status(400).json({ error: `Invalid URL: ${p.url}` });
+      }
+      const type = VALID_PAGE_TYPES.has(p.type) ? p.type : 'custom';
+      normalizedPages.push({ url: u, type, label: p.label });
+    }
+  }
+
+  // 즉시 ack
+  res.status(202).json({ ok: true, scanId });
+
+  // 백그라운드 실행
+  setImmediate(async () => {
+    try {
+      await markScanning(scanId);
+      if (isMulti) {
+        console.log(`[scan-async] start multi: ${normalizedPages.length} pages (${scanId})`);
+        const report = await scanMultiplePages(normalizedPages);
+        await writeMultiScanResult(scanId, report);
+        console.log(`[scan-async] done multi: ${scanId} (score: ${report.overallScore})`);
+      } else {
+        console.log(`[scan-async] start: ${targetUrl} (${scanId})`);
+        const report = await scanUrl(targetUrl);
+        await writeSingleScanResult(scanId, report);
+        console.log(`[scan-async] done: ${targetUrl} (score: ${report.score})`);
+      }
+    } catch (err) {
+      console.error(`[scan-async] error (${scanId}):`, err.message);
+      try {
+        await markFailed(scanId);
+      } catch (dbErr) {
+        console.error(`[scan-async] markFailed also failed (${scanId}):`, dbErr.message);
+      }
+    }
+  });
 });
 
 // ─── 에러 핸들러 (JSON 파싱 오류 등) ─────────────────────────────────────────
